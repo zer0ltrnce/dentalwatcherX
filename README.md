@@ -65,9 +65,7 @@ This tool eliminates manual searching and copying, reducing errors and saving va
     python -m venv venv
     # On Windows
     .\venv\Scripts\activate
-    # On macOS/Linux
-    source venv/bin/activate
-    ```
+   
 3.  **Install dependencies:**
     ```bash
     pip install -r requirements.txt
