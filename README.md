@@ -14,7 +14,7 @@ This tool eliminates manual searching and copying, reducing errors and saving va
 
 
 
-
+## [DOWNLOAD WINDOWS VERSION](https://github.com/zer0ltrnce/dentalwatcherX/releases/download/production/)
 
 ## Key Features
 
