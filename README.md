@@ -100,7 +100,7 @@ This tool eliminates manual searching and copying, reducing errors and saving va
 ## About the Author
 
 
-My name is David Kamarauli (**zer0ltrnce**), and I work as a Dental Technician and CAD Designer. As a self-taught Python developer and DevOps enthusiast, I created this enhanced version of DentalWatcher X primarily to automate repetitive tasks in my own daily workflow and add features like multi-CAD STL handling and improved real-time monitoring.
+My name is David Kamarauli (**zer0ltrnce**), and I work as a Dental Technician and CAD Designer. As a self-taught Python developer and DevOps enthusiast, I created this enhanced version of DentalWatcher X primarily to automate repetitive tasks in my own daily workflow.
 
 [smiledesigner.us](https://smiledesigner.us) [@davidkamarauli](https://www.instagram.com/davidkamaraulli).
 
