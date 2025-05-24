@@ -29,6 +29,7 @@ from core import (
     SETTINGS_AUTO_SEND_ENABLED, DEFAULT_AUTO_SEND_ENABLED,
     SETTINGS_DUPLICATE_CHECK_ACTION, DEFAULT_DUPLICATE_CHECK_ACTION,
     SETTINGS_AUTO_DUPLICATE_ACTION, DEFAULT_AUTO_DUPLICATE_ACTION,
+    SETTINGS_NETWORK_SCAN_DEPTH, DEFAULT_NETWORK_SCAN_DEPTH, # Import new settings
     AUTO_SEND_STATUS_FILE, VIEWER_BACKGROUND_COLOR, VIEWER_MODEL_COLOR,
     VIEWER_AXES_ENABLED
 )
@@ -63,6 +64,27 @@ class HotkeySignalEmitter(QObject):
 
 class WatchdogSignalEmitter(QObject):
     file_change_detected = pyqtSignal(str) # send the path that changed
+
+# Worker for background scanning
+class ScanWorker(QObject):
+    scan_complete = pyqtSignal(list, float)  # found_files_data, scan_duration
+    scan_error = pyqtSignal(str, float)      # error_message, scan_duration
+
+    def __init__(self, watch_folder, network_scan_depth): # Added network_scan_depth
+        super().__init__()
+        self.watch_folder = watch_folder
+        self.network_scan_depth = network_scan_depth
+
+    def run_scan(self):
+        start_time = time.time()
+        try:
+            # Pass network_scan_depth to core.scan_directory
+            found_files_data = core.scan_directory(self.watch_folder, network_scan_depth=self.network_scan_depth)
+            scan_duration = time.time() - start_time
+            self.scan_complete.emit(found_files_data, scan_duration)
+        except Exception as e:
+            scan_duration = time.time() - start_time
+            self.scan_error.emit(str(e), scan_duration)
 
 # application styles (Neon Void theme)
 NEON_VOID_STYLE = """
@@ -421,6 +443,9 @@ class SettingsDialog(QDialog):
                                                             DEFAULT_DUPLICATE_CHECK_ACTION)
         self.current_auto_duplicate_action = self.settings.value(SETTINGS_AUTO_DUPLICATE_ACTION,
                                                                  DEFAULT_AUTO_DUPLICATE_ACTION)
+        self.current_network_scan_depth = self.settings.value(SETTINGS_NETWORK_SCAN_DEPTH,
+                                                              DEFAULT_NETWORK_SCAN_DEPTH, type=int)
+
 
         layout = QVBoxLayout(self)
         form_layout = QFormLayout()
@@ -540,6 +565,23 @@ class SettingsDialog(QDialog):
         form_layout.addRow("Duplicates (Auto Send):", self.auto_duplicate_action_combo)
         self.update_auto_duplicate_enabled_state() # Set initial enabled state
 
+        performance_label = QLabel("Performance")
+        performance_label.setStyleSheet("font-weight: bold; margin-top: 15px; margin-bottom: 5px;")
+        form_layout.addRow(performance_label)
+
+        self.network_scan_depth_edit = QLineEdit(str(self.current_network_scan_depth))
+        self.network_scan_depth_edit.setValidator(QIntValidator(0, 10)) # 0 for unlimited, up to 10 levels
+        self.network_scan_depth_edit.setToolTip(
+            "Max depth for Watch Folder scans (0 = unlimited, default for os.walk).\n"
+            "Lower values (e.g., 2-4) can speed up scans on network/slow drives.\n"
+            "Does not apply to specific project folder scans triggered by file watcher."
+        )
+        depth_layout = QHBoxLayout()
+        depth_layout.addWidget(self.network_scan_depth_edit)
+        depth_layout.addWidget(QLabel("levels (0=unlimited)"))
+        depth_layout.addStretch()
+        form_layout.addRow("Network/Slow Scan Depth:", depth_layout)
+
 
         layout.addLayout(form_layout)
         layout.addStretch(1)
@@ -597,6 +639,13 @@ class SettingsDialog(QDialog):
         auto_send_enabled = self.auto_send_enabled_checkbox.isChecked()
         duplicate_action = self.duplicate_action_combo.currentData()
         auto_duplicate_action = self.auto_duplicate_action_combo.currentData()
+        try:
+            network_scan_depth_int = int(self.network_scan_depth_edit.text())
+            if not (0 <= network_scan_depth_int <= 10): # Validate range
+                 network_scan_depth_int = DEFAULT_NETWORK_SCAN_DEPTH
+        except ValueError:
+            network_scan_depth_int = DEFAULT_NETWORK_SCAN_DEPTH
+
 
         errors = []
         if not watch_folder:
@@ -635,7 +684,9 @@ class SettingsDialog(QDialog):
         self.settings.setValue(SETTINGS_NOTIFICATION_DEBOUNCE_SECS, notify_debounce)
         self.settings.setValue(SETTINGS_AUTO_SEND_ENABLED, auto_send_enabled)
         self.settings.setValue(SETTINGS_DUPLICATE_CHECK_ACTION, duplicate_action)
-        self.settings.setValue(SETTINGS_AUTO_DUPLICATE_ACTION, auto_duplicate_action) # Save new setting
+        self.settings.setValue(SETTINGS_AUTO_DUPLICATE_ACTION, auto_duplicate_action)
+        self.settings.setValue(SETTINGS_NETWORK_SCAN_DEPTH, network_scan_depth_int)
+
 
         if KEYBOARD_AVAILABLE:
             if hotkey != self.current_hotkey:
@@ -1101,6 +1152,8 @@ class MainWindow(QMainWindow):
     active_notification_dialog = None # reference to the notification popup if open
     recently_notified_projects = {} # track last notify time per folder path {folder_path: timestamp}
     auto_send_status = {} # track auto-sends today {folder_path: {"cam_sent": bool, "print_sent": bool, "date": "YYYY-MM-DD"}}
+    scan_thread = None # For QThread
+    scan_worker = None # For ScanWorker
 
     class DuplicateAction:
         ASK = 0
@@ -1117,8 +1170,10 @@ class MainWindow(QMainWindow):
         self.watchdog_signal_emitter = watchdog_emitter
         self.settings = QSettings(ORG_NAME, APP_NAME)
         self.listener_thread = None
-        self.is_listener_intentionally_stopped = False
+        self.is_listener_intentionally_stopped = False # May still be useful for differentiating explicit stops vs temporary disables
         self.is_operation_running = False
+        self.scan_thread = None # Initialize scan_thread
+        self.scan_worker = None # Initialize scan_worker
 
         self.fs_observer = None
         self.fs_event_handler = None
@@ -1140,7 +1195,7 @@ class MainWindow(QMainWindow):
             self.watchdog_signal_emitter.file_change_detected.connect(self.handle_filesystem_change)
 
         self.check_folders_exist()
-        self.start_hotkey_listener()
+        # self.start_hotkey_listener() # Initial call moved to after UI setup, e.g. end of __init__
         self.start_file_watcher()
 
         if not KEYBOARD_AVAILABLE:
@@ -1153,6 +1208,8 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(200, lambda: self.show_library_warning("Watchdog", "watchdog",
                                                                      "Real-time File Notifications & Auto-Send disabled.",
                                                                      "Install via: pip install watchdog"))
+        
+        self.start_hotkey_listener() # Call it here, after everything else is set up
 
     def show_library_warning(self, lib_name, install_name, consequence, note=""):
         """Generic warning popup for missing optional libraries."""
@@ -1183,6 +1240,8 @@ class MainWindow(QMainWindow):
                                                                   DEFAULT_DUPLICATE_CHECK_ACTION)
         self.auto_duplicate_action_setting = self.settings.value(SETTINGS_AUTO_DUPLICATE_ACTION,
                                                                 DEFAULT_AUTO_DUPLICATE_ACTION)
+        self.network_scan_depth = self.settings.value(SETTINGS_NETWORK_SCAN_DEPTH,
+                                                      DEFAULT_NETWORK_SCAN_DEPTH, type=int)
 
 
     def reload_settings_and_update_ui(self):
@@ -1428,7 +1487,8 @@ class MainWindow(QMainWindow):
         self.archive_status_label = QLabel(); self.archive_status_label.setObjectName("statusBarLabel")
         self.live_notify_status_label = QLabel(); self.live_notify_status_label.setObjectName("statusBarLabel")
         self.auto_send_status_label = QLabel(); self.auto_send_status_label.setObjectName("statusBarLabel")
-        self.auto_dup_status_label = QLabel(); self.auto_dup_status_label.setObjectName("statusBarLabel") # Label for AutoDup status
+        self.auto_dup_status_label = QLabel(); self.auto_dup_status_label.setObjectName("statusBarLabel")
+        self.network_depth_status_label = QLabel(); self.network_depth_status_label.setObjectName("statusBarLabel") # New status label
         self.hotkey_status_label = QLabel(); self.hotkey_status_label.setObjectName("statusBarLabel")
         self.statusBar.addPermanentWidget(self.watch_status_label)
         self.statusBar.addPermanentWidget(self.cam_target_status_label)
@@ -1436,7 +1496,8 @@ class MainWindow(QMainWindow):
         self.statusBar.addPermanentWidget(self.archive_status_label)
         self.statusBar.addPermanentWidget(self.live_notify_status_label)
         self.statusBar.addPermanentWidget(self.auto_send_status_label)
-        self.statusBar.addPermanentWidget(self.auto_dup_status_label) # Add the new status label
+        self.statusBar.addPermanentWidget(self.auto_dup_status_label)
+        self.statusBar.addPermanentWidget(self.network_depth_status_label) # Add new status label
         self.statusBar.addPermanentWidget(self.hotkey_status_label)
         self.update_status_bar()
 
@@ -1534,27 +1595,41 @@ class MainWindow(QMainWindow):
                 self.active_notification_dialog.reject(); self.active_notification_dialog = None
             except Exception: pass
 
-        self.stop_hotkey_listener(intentional=True)
+        # Temporarily disable hotkey action, don't stop the thread unless hotkey changes
+        self.disable_hotkey_action_temporarily()
+        self.is_listener_intentionally_stopped = True # Mark as intentional for this period
         self.stop_file_watcher()
 
         dialog = SettingsDialog(self.settings, self)
         result = dialog.exec()
-        hotkey_actually_changed = False
+        
+        hotkey_value_before_dialog = self.hotkey_combo 
+
         if result == QDialog.DialogCode.Accepted:
-            if KEYBOARD_AVAILABLE and dialog.new_hotkey_value is not None and self.hotkey_combo != dialog.new_hotkey_value:
-                hotkey_actually_changed = True
-                print(f"[Settings] Hotkey changed from '{self.hotkey_combo}' to '{dialog.new_hotkey_value}'.")
+            self.reload_settings_and_update_ui() # This reloads all settings from storage, including self.hotkey_combo
 
-            self.reload_settings_and_update_ui() # This reloads all settings from storage
+            new_hotkey_value_from_settings = self.settings.value(SETTINGS_HOTKEY, DEFAULT_HOTKEY)
 
-            self.start_hotkey_listener(force_restart=hotkey_actually_changed)
+            if KEYBOARD_AVAILABLE:
+                if hotkey_value_before_dialog != new_hotkey_value_from_settings:
+                    print(f"[Settings] Hotkey changed from '{hotkey_value_before_dialog}' to '{new_hotkey_value_from_settings}'. Stopping old listener.")
+                    if self.listener_thread and self.listener_thread.is_alive():
+                        self.listener_thread.stop() # Fully stop and unhook
+                        self.listener_thread.join(timeout=0.5) # Wait for it to die
+                    self.listener_thread = None # Discard old thread
+                    self.start_hotkey_listener() # This will create a new listener with the new hotkey
+                else:
+                    print("[Settings] Hotkey unchanged. Re-enabling action on existing listener.")
+                    self.is_listener_intentionally_stopped = False # Allow re-enabling
+                    self.start_hotkey_listener() # This will call enable_action()
+            
             if not self.fs_observer and (self.live_notify_enabled or self.auto_send_enabled):
                  print("[Settings] Restarting file watcher after settings close (was stopped).")
                  self.start_file_watcher()
-
         else: # User cancelled settings dialog
-             print("[Settings] Settings cancelled, restarting listeners/watchers if they were active.")
-             self.start_hotkey_listener() # Restarts if needed based on old settings
+             print("[Settings] Settings cancelled. Re-enabling action on existing listener.")
+             self.is_listener_intentionally_stopped = False # Allow re-enabling
+             self.start_hotkey_listener() # Re-enable action
              self.start_file_watcher() # Restarts if needed based on old settings
 
 
@@ -1603,6 +1678,9 @@ class MainWindow(QMainWindow):
              auto_dup_status = self.auto_duplicate_action_setting.capitalize()
         auto_dup_display = f"⚙️AutoDup: {auto_dup_status}"
 
+        network_depth_display_val = "Unlimited" if self.network_scan_depth == 0 else str(self.network_scan_depth)
+        network_depth_display = f"ScanDepth: {network_depth_display_val}"
+
 
         self.watch_status_label.setText(f"👁️ Watch: {watch_display}")
         self.watch_status_label.setToolTip(self.watch_folder if self.watch_folder else "Watch folder not set")
@@ -1630,6 +1708,13 @@ class MainWindow(QMainWindow):
         autodup_tooltip = "Automatic duplicate handling setting (for Auto-Send/Triggers)."
         if not (WATCHDOG_AVAILABLE and self.auto_send_enabled): autodup_tooltip = "N/A (Requires Watchdog and Auto-Send enabled)"
         self.auto_dup_status_label.setToolTip(autodup_tooltip + f"\nCurrent: {self.auto_duplicate_action_setting.capitalize()}")
+
+        self.network_depth_status_label.setText(network_depth_display)
+        depth_tooltip = f"Watch Folder scan depth: {network_depth_display_val} levels."
+        if self.network_scan_depth == 0: depth_tooltip += " (Deepest scan, potentially slow on network drives)"
+        else: depth_tooltip += " (Limited depth for faster network scans)"
+        self.network_depth_status_label.setToolTip(depth_tooltip)
+
 
         self.hotkey_status_label.setText(hotkey_display)
         hotkey_tooltip = "Global hotkey disabled (requires 'keyboard' library)."
@@ -1717,13 +1802,13 @@ class MainWindow(QMainWindow):
 
     def handle_hotkey_press(self):
         """Handles the signal from the HotkeyListener thread."""
-        if not self.is_listener_intentionally_stopped and not self.is_operation_running:
+        if not self.is_operation_running: # Removed is_listener_intentionally_stopped check here as the listener's 'enabled' flag handles it
             print(f"Hotkey '{self.hotkey_combo}' detected, triggering scan...")
             self.show_window() # Bring window to front
             QTimer.singleShot(50, self.scan_and_show) # Delay slightly to ensure window shows first
         else:
-            reason = "operation running" if self.is_operation_running else "listener intentionally stopped"
-            print(f"Hotkey '{self.hotkey_combo}' ignored: {reason}")
+            # reason = "operation running" if self.is_operation_running else "listener action disabled" # More accurate
+            print(f"Hotkey '{self.hotkey_combo}' ignored: operation running or listener action disabled.")
 
     # filesystem change handler
     def handle_filesystem_change(self, changed_path):
@@ -1878,100 +1963,129 @@ class MainWindow(QMainWindow):
 
     # manual/hotkey scan function
     def scan_and_show(self):
-        """Performs the full directory scan and populates the table."""
+        """Performs the full directory scan in a background thread and populates the table."""
         if self.is_operation_running:
             print("Scan skipped: Another operation is already running.")
             self.statusBar.showMessage("Scan skipped: Operation in progress.", 3000)
             return
-        if not self.check_folders_exist(): # check_folders_exist shows its own message
+        if not self.check_folders_exist():  # check_folders_exist shows its own message
             return
 
         self.is_operation_running = True
-        self.update_button_state() # Disable buttons during scan
-        self.statusBar.showMessage(f"Scanning '{shorten_path(self.watch_folder)}' for projects modified today...", 0) # Persistent message
+        self.update_button_state()  # Disable buttons during scan
+        self.statusBar.showMessage(f"Scanning '{shorten_path(self.watch_folder)}' for projects modified today...", 0)  # Persistent message
         self.info_label.setText(f"Scanning '{shorten_path(self.watch_folder)}'...")
-        QCoreApplication.processEvents() # Update UI
+        self.table_widget.setRowCount(0) # Clear table before scan
+        QCoreApplication.processEvents()  # Update UI
 
+        # Kill previous thread and worker if they exist and are running
+        if self.scan_thread and self.scan_thread.isRunning():
+            print("Terminating previous scan thread...")
+            self.scan_thread.quit() # Request termination
+            self.scan_thread.wait(2000) # Wait up to 2 seconds
+            if self.scan_thread.isRunning(): # Force terminate if still running
+                 print("Force terminating previous scan thread.")
+                 self.scan_thread.terminate()
+                 self.scan_thread.wait()
+            self.scan_thread = None
+            self.scan_worker = None
+
+
+        self.scan_thread = QThread()
+        # Pass network_scan_depth to ScanWorker
+        self.scan_worker = ScanWorker(self.watch_folder, self.network_scan_depth)
+        self.scan_worker.moveToThread(self.scan_thread)
+
+        # Connections
+        self.scan_thread.started.connect(self.scan_worker.run_scan)
+        self.scan_worker.scan_complete.connect(self._handle_scan_complete)
+        self.scan_worker.scan_error.connect(self._handle_scan_error)
+
+        # Cleanup connections
+        self.scan_thread.finished.connect(self._finalize_scan_operation) # Central cleanup
+        self.scan_thread.finished.connect(self.scan_thread.deleteLater)
+        # self.scan_worker.finished.connect(self.scan_worker.deleteLater) # QObject doesn't have a finished signal
+
+        self.scan_thread.start()
+
+    def _handle_scan_complete(self, found_files_data, scan_duration):
+        """Handles successful scan results from the ScanWorker."""
+        print(f"Scan completed in {scan_duration:.2f} seconds.")
         self.table_widget.setSortingEnabled(False) # Disable sorting during population
-        self.table_widget.setRowCount(0)
 
-        found_files_data = []
-        scan_error = None
-        start_time = time.time()
-        try:
-            found_files_data = scan_directory(self.watch_folder)
-        except Exception as e:
-            scan_error = e
-            print(f"Scan Error: {e}")
-            QMessageBox.critical(self, "Scan Error", f"An unexpected error occurred during scan:\n{e}")
-        finally:
-            end_time = time.time()
-            scan_duration = end_time - start_time
-            print(f"Scan finished in {scan_duration:.2f} seconds.")
+        if found_files_data:
+            count = len(found_files_data)
+            plural_s = "s" if count != 1 else ""
+            viewer_info = "(Double-click row to view STLs)" if VTK_AVAILABLE else "(STL Viewer disabled)"
+            self.info_label.setText(f"Found {count} project{plural_s} modified today. {viewer_info}")
+            self.statusBar.showMessage(f"Scan complete: Found {count} project{plural_s}. ({scan_duration:.2f}s)", 5000)
 
-            if found_files_data:
-                count = len(found_files_data);
-                plural_s = "s" if count != 1 else ""
-                viewer_info = "(Double-click row to view STLs)" if VTK_AVAILABLE else "(STL Viewer disabled)"
-                self.info_label.setText(f"Found {count} project{plural_s} modified today. {viewer_info}")
-                self.statusBar.showMessage(f"Scan complete: Found {count} project{plural_s}. ({scan_duration:.2f}s)", 5000) # Timed message
+            self.table_widget.setUpdatesEnabled(False)  # Batch update start
+            try:
+                self.table_widget.setRowCount(count)  # Pre-allocate rows
+                for row, item_data in enumerate(found_files_data):
+                    timestamp_for_sort = int(item_data["last_modified_timestamp"])
+                    relative_time_str = get_relative_time(item_data["last_modified_timestamp"])
+                    item_time = QTableWidgetItem(relative_time_str)
+                    item_time.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                    item_time.setData(Qt.ItemDataRole.UserRole + 1, timestamp_for_sort)
+                    item_time.setData(Qt.ItemDataRole.UserRole, item_data)
 
-                self.table_widget.setUpdatesEnabled(False) # Batch update start
-                try:
-                    self.table_widget.setRowCount(count) # Pre-allocate rows
-                    for row, item_data in enumerate(found_files_data):
-                        timestamp_for_sort = int(item_data["last_modified_timestamp"])
-                        relative_time_str = get_relative_time(item_data["last_modified_timestamp"])
-                        item_time = QTableWidgetItem(relative_time_str)
-                        item_time.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-                        item_time.setData(Qt.ItemDataRole.UserRole + 1, timestamp_for_sort) # Store timestamp for sorting
-                        item_time.setData(Qt.ItemDataRole.UserRole, item_data)
+                    item_patient = QTableWidgetItem(item_data["patient"])
+                    item_patient.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
 
-                        item_patient = QTableWidgetItem(item_data["patient"])
-                        item_patient.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+                    item_work = QTableWidgetItem(item_data["work_type"])
+                    item_work.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
 
-                        item_work = QTableWidgetItem(item_data["work_type"])
-                        item_work.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+                    item_teeth = QTableWidgetItem(item_data["teeth"])
+                    if "Full Arch" in item_data["teeth"]:
+                        item_teeth.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+                    else:
+                        item_teeth.setTextAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
 
-                        item_teeth = QTableWidgetItem(item_data["teeth"])
-                        if "Full Arch" in item_data["teeth"]:
-                             item_teeth.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-                        else:
-                             item_teeth.setTextAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
+                    item_status = QTableWidgetItem(item_data["file_status"])
+                    item_status.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    icons = item_data.get("status_icons", ("?", "?", "?"))
+                    if all(i == "✓" for i in icons): item_status.setForeground(QColor("#00FF7F"))
+                    elif any(i == "✓" for i in icons): item_status.setForeground(QColor("#FFD700"))
+                    else: item_status.setForeground(QColor("#FF4D4D"))
 
+                    self.table_widget.setItem(row, 0, item_time)
+                    self.table_widget.setItem(row, 1, item_patient)
+                    self.table_widget.setItem(row, 2, item_work)
+                    self.table_widget.setItem(row, 3, item_teeth)
+                    self.table_widget.setItem(row, 4, item_status)
 
-                        item_status = QTableWidgetItem(item_data["file_status"])
-                        item_status.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                        icons = item_data.get("status_icons", ("?", "?", "?"))
-                        if all(i == "✓" for i in icons): item_status.setForeground(QColor("#00FF7F")) # Green (all ok)
-                        elif any(i == "✓" for i in icons): item_status.setForeground(QColor("#FFD700")) # Yellow (partial)
-                        else: item_status.setForeground(QColor("#FF4D4D")) # Red (none ok)
+                    tooltip_text = self.generate_row_tooltip(item_data)
+                    item_time.setToolTip(tooltip_text)
+            finally:
+                self.table_widget.setUpdatesEnabled(True)  # Batch update end
+                self.table_widget.setSortingEnabled(True)
+                self.table_widget.sortByColumn(0, Qt.SortOrder.DescendingOrder)
+        else:
+            self.info_label.setText(f"No projects modified today found in '{shorten_path(self.watch_folder)}'.")
+            self.statusBar.showMessage(f"Scan complete: No projects found modified today. ({scan_duration:.2f}s)", 5000)
 
-                        self.table_widget.setItem(row, 0, item_time)
-                        self.table_widget.setItem(row, 1, item_patient)
-                        self.table_widget.setItem(row, 2, item_work)
-                        self.table_widget.setItem(row, 3, item_teeth)
-                        self.table_widget.setItem(row, 4, item_status)
+        self.table_widget.setSortingEnabled(True) # Ensure sorting is re-enabled
 
-                        tooltip_text = self.generate_row_tooltip(item_data)
-                        item_time.setToolTip(tooltip_text) # Apply tooltip to first cell, spans row
+    def _handle_scan_error(self, error_message, scan_duration):
+        """Handles scan errors from the ScanWorker."""
+        print(f"Scan Error (took {scan_duration:.2f}s): {error_message}")
+        QMessageBox.critical(self, "Scan Error", f"An unexpected error occurred during scan:\n{error_message}")
+        self.info_label.setText("Scan failed. Check error messages.")
+        self.statusBar.showMessage(f"Scan failed! ({scan_duration:.1f}s)", 5000)
 
-                finally:
-                    self.table_widget.setUpdatesEnabled(True) # Batch update end
-                    self.table_widget.setSortingEnabled(True) # Re-enable sorting
-                    self.table_widget.sortByColumn(0, Qt.SortOrder.DescendingOrder)
+    def _finalize_scan_operation(self):
+        """Finalizes the scan operation, resetting UI state."""
+        print("Finalizing scan operation...")
+        self.is_operation_running = False
+        self.update_button_state() # Re-enable buttons and update tooltips
+        # Clean up references to thread and worker if they are done
+        if self.scan_thread and self.scan_thread.isFinished():
+             print("Scan thread finished. Cleaning up references.")
+             self.scan_thread = None
+             self.scan_worker = None # Worker should be deleted by deleteLater if connected properly
 
-            elif not scan_error: # Scan finished ok, but no files found
-                self.info_label.setText(
-                    f"No projects modified today found in '{shorten_path(self.watch_folder)}'.")
-                self.statusBar.showMessage(f"Scan complete: No projects found modified today. ({scan_duration:.2f}s)", 5000)
-            else: # Scan failed
-                 self.info_label.setText("Scan failed. Check error messages.")
-                 self.statusBar.showMessage(f"Scan failed! ({scan_duration:.1f}s)", 5000)
-
-
-            self.is_operation_running = False # Operation finished
-            self.update_button_state() # Re-enable buttons
 
     def generate_row_tooltip(self, item_data):
         """Generates rich text tooltip for a table row."""
@@ -2074,7 +2188,7 @@ class MainWindow(QMainWindow):
                                     f"No viewable STL files were found associated with project:\n{item_data.get('patient', 'Unknown')}")
             return
 
-        self.stop_hotkey_listener(intentional=False); # False = temporarily stopped
+        self.disable_hotkey_action_temporarily()
         self.stop_file_watcher() # Stop watcher too
 
         try:
@@ -2090,7 +2204,7 @@ class MainWindow(QMainWindow):
             self.current_stl_viewer.show()
         except Exception as e_viewer:
             QMessageBox.critical(self, "Viewer Launch Error", f"Failed to open the STL viewer:\n{e_viewer}")
-            self.start_hotkey_listener();
+            self.start_hotkey_listener() # Re-enable listener action
             self.start_file_watcher()
 
     def handle_table_double_click(self, item):
@@ -2106,9 +2220,9 @@ class MainWindow(QMainWindow):
 
     def _handle_viewer_closed(self, result_code):
         """Callback when the STL viewer dialog is closed. Restarts listeners."""
-        print("STL Viewer closed, restarting listeners/watchers...")
+        print("STL Viewer closed, re-enabling hotkey action and restarting watchers...")
         self.current_stl_viewer = None
-        QTimer.singleShot(50, self.start_hotkey_listener)
+        QTimer.singleShot(50, self.start_hotkey_listener) # Re-enable listener action
         QTimer.singleShot(60, self.start_file_watcher)
 
     # handle table context menu (right click)
@@ -2121,14 +2235,14 @@ class MainWindow(QMainWindow):
             try: self.active_notification_dialog.reject(); self.active_notification_dialog = None
             except Exception: pass
 
-        self.stop_hotkey_listener(intentional=False);
+        self.disable_hotkey_action_temporarily()
         self.stop_file_watcher()
 
         try:
             index = self.table_widget.indexAt(point)
             if not index.isValid():
                 print("[Context Menu] Invalid index.")
-                self.start_hotkey_listener(); self.start_file_watcher(); return
+                self.start_hotkey_listener(); self.start_file_watcher(); return # Re-enable and return
 
             row = index.row();
             item_data = None
@@ -2137,7 +2251,7 @@ class MainWindow(QMainWindow):
 
             if not item_data:
                 print(f"[Context Menu] No data found for row {row}.")
-                self.start_hotkey_listener(); self.start_file_watcher(); return
+                self.start_hotkey_listener(); self.start_file_watcher(); return # Re-enable and return
 
             menu = QMenu(self);
             menu.setStyleSheet(NEON_VOID_STYLE) # Apply theme to menu
@@ -2219,17 +2333,17 @@ class MainWindow(QMainWindow):
         except Exception as e_menu:
             QMessageBox.critical(self, "Menu Error",
                                  f"A Python error occurred while creating the context menu:\n{e_menu}")
-            self.start_hotkey_listener();
+            self.start_hotkey_listener() # Re-enable listener action
             self.start_file_watcher()
 
     def _handle_menu_closed(self):
-        """Restarts listeners after the context menu is hidden."""
+        """Re-enables hotkey action and restarts watchers after the context menu is hidden."""
         sender = self.sender()
         if isinstance(sender, QMenu):
             try: sender.aboutToHide.disconnect(self._handle_menu_closed)
             except TypeError: pass # Already disconnected
-        print("[Context Menu] Closed, restarting listeners.")
-        QTimer.singleShot(10, self.start_hotkey_listener)
+        print("[Context Menu] Closed, re-enabling hotkey action and restarting watchers.")
+        QTimer.singleShot(10, self.start_hotkey_listener) # Re-enable listener action
         QTimer.singleShot(20, self.start_file_watcher)
 
 
@@ -2418,7 +2532,7 @@ class MainWindow(QMainWindow):
 
     def ask_duplicate_action(self, filename, target_folder, ask_for_all=False):
         """Shows a dialog asking the user what to do with a duplicate file. Returns DuplicateAction enum."""
-        self.stop_hotkey_listener(intentional=False)
+        self.disable_hotkey_action_temporarily()
         self.stop_file_watcher()
 
         msgBox = QMessageBox(self)
@@ -2451,7 +2565,7 @@ class MainWindow(QMainWindow):
         elif ask_for_all and clicked_button == skip_all_button: result = self.DuplicateAction.SKIP
         elif clicked_button == cancel_button: result = self.DuplicateAction.CANCEL
 
-        QTimer.singleShot(10, self.start_hotkey_listener)
+        QTimer.singleShot(10, self.start_hotkey_listener) # Re-enable listener action
         QTimer.singleShot(20, self.start_file_watcher)
         return result
 
@@ -2495,7 +2609,13 @@ class MainWindow(QMainWindow):
             else: print(f"Send CAM skipped for {display_name}: {msg}")
             self.is_operation_running = False; self.update_button_state(); return False
 
-        self.stop_hotkey_listener(intentional=True); self.stop_file_watcher() # Stop during copy
+        # For single project actions, we might still want to temporarily disable hotkey action
+        # but not fully stop the listener unless it's a long operation.
+        # For now, let's assume these are quick enough not to need disabling,
+        # or rely on is_operation_running to prevent concurrent hotkey scans.
+        # self.disable_hotkey_action_temporarily() # Consider if needed
+        
+        self.stop_file_watcher() # Stop file watcher during copy operations
         archive_stats = self.trigger_archive_if_needed(self.target_folder_cam, "CAM") # Archive *before* copying
 
         files_to_process = ([info_path] if info_exists else []) + cad_stl_paths
@@ -2537,7 +2657,8 @@ class MainWindow(QMainWindow):
                 else: print(f"Auto-Send CAM failed for {display_name}. Errors: {len(operation_stats['errors'])}. Check logs.")
 
             self.is_operation_running = False; self.update_button_state() # Re-enable buttons
-            self.start_hotkey_listener(); self.start_file_watcher() # Restart listeners
+            # self.start_hotkey_listener() # Re-enable if it was disabled
+            self.start_file_watcher() # Restart file watcher
 
         return operation_successful
 
@@ -2576,7 +2697,8 @@ class MainWindow(QMainWindow):
             else: print(f"Send Print skipped for {display_name}: {msg}")
             self.is_operation_running = False; self.update_button_state(); return False
 
-        self.stop_hotkey_listener(intentional=True); self.stop_file_watcher()
+        # self.disable_hotkey_action_temporarily() # Consider if needed
+        self.stop_file_watcher()
         archive_stats = self.trigger_archive_if_needed(self.target_folder_print, "Print")
         operation_stats = {"project_name": display_name, "copied": 0, "skipped": 0, "errors": [], "cancelled": False}
 
@@ -2616,7 +2738,8 @@ class MainWindow(QMainWindow):
                 else: print(f"Auto-Send Print failed for {display_name}. Errors: {len(operation_stats['errors'])}. Check logs.")
 
             self.is_operation_running = False; self.update_button_state()
-            self.start_hotkey_listener(); self.start_file_watcher()
+            # self.start_hotkey_listener() # Re-enable if it was disabled
+            self.start_file_watcher()
 
         return operation_successful
 
@@ -2648,7 +2771,7 @@ class MainWindow(QMainWindow):
         if not self.check_or_create_folder(self.target_folder_cam, "Target (CAM)"): return
 
         self.is_operation_running = True; self.update_button_state() # Block UI
-        self.stop_hotkey_listener(intentional=True); self.stop_file_watcher() # Stop listeners
+        self.disable_hotkey_action_temporarily(); self.stop_file_watcher() # Disable hotkey action, stop watcher
         archive_stats = self.trigger_archive_if_needed(self.target_folder_cam, "CAM") # Archive first
         all_operation_stats = []; skipped_projects_info = []
         self.current_multi_duplicate_choice = self.DuplicateAction.ASK # Reset choice for this operation
@@ -2715,7 +2838,7 @@ class MainWindow(QMainWindow):
             self.update_hotkey_ui_elements(); self.statusBar.clearMessage()
             self.show_copy_summary("Multi Send to CAM", all_operation_stats, self.target_folder_cam, skipped_projects_info, archive_stats, operation_cancelled_globally)
             self.is_operation_running = False; self.update_button_state() # Re-enable UI
-            self.start_hotkey_listener(); self.start_file_watcher() # Restart listeners
+            self.start_hotkey_listener(); self.start_file_watcher() # Re-enable hotkey action, restart watcher
 
 
     def process_selected_print_files(self):
@@ -2744,7 +2867,7 @@ class MainWindow(QMainWindow):
         if not self.check_or_create_folder(self.target_folder_print, "Target (Print)"): return
 
         self.is_operation_running = True; self.update_button_state()
-        self.stop_hotkey_listener(intentional=True); self.stop_file_watcher()
+        self.disable_hotkey_action_temporarily(); self.stop_file_watcher() # Disable hotkey action, stop watcher
         archive_stats = self.trigger_archive_if_needed(self.target_folder_print, "Print")
         all_operation_stats = []; skipped_projects_info = []
         self.current_multi_duplicate_choice = self.DuplicateAction.ASK
@@ -2803,7 +2926,7 @@ class MainWindow(QMainWindow):
             self.update_hotkey_ui_elements(); self.statusBar.clearMessage()
             self.show_copy_summary("Multi Send to Print", all_operation_stats, self.target_folder_print, skipped_projects_info, archive_stats, operation_cancelled_globally)
             self.is_operation_running = False; self.update_button_state()
-            self.start_hotkey_listener(); self.start_file_watcher()
+            self.start_hotkey_listener(); self.start_file_watcher() # Re-enable hotkey action, restart watcher
 
 
     def open_folder_in_explorer(self, folder_path):
@@ -3069,68 +3192,55 @@ class MainWindow(QMainWindow):
         self.last_failed_items = []
 
     # controlling the hotkey listener thread
-    def start_hotkey_listener(self, force_restart=False):
-        """Starts the background thread to listen for the global hotkey."""
+    def start_hotkey_listener(self):
+        """Ensures the HotkeyListener is running and its action is enabled,
+           unless intentionally stopped or an operation is running."""
         if not KEYBOARD_AVAILABLE:
             return
-        if self.is_operation_running:
-             return
-
-        self.is_listener_intentionally_stopped = False # Assume we want it running now
+        if self.is_operation_running: # Don't mess with listener if an operation is busy
+            print("[Hotkey] start_hotkey_listener skipped: operation running.")
+            return
+        if self.is_listener_intentionally_stopped: # If explicitly stopped (e.g. during settings)
+            print("[Hotkey] start_hotkey_listener skipped: listener intentionally stopped flag is set.")
+            return
 
         if self.listener_thread and self.listener_thread.is_alive():
-            if force_restart:
-                print("[Hotkey] Forcing restart of listener...")
-                self.stop_hotkey_listener(intentional=False) # Stop temporarily
-            else:
-                return # Already running and no force restart
+            print(f"[Hotkey] Listener for '{self.hotkey_combo}' already running. Enabling action.")
+            self.listener_thread.enable_action()
+        else:
+            if self.listener_thread and not self.listener_thread.is_alive():
+                 print("[Hotkey] Cleaning up dead listener thread reference before starting new one.")
+                 self.listener_thread = None # Ensure old one is gone
 
-        if self.listener_thread and not self.listener_thread.is_alive():
-             print("[Hotkey] Cleaning up dead listener thread reference.")
-             self.listener_thread = None
-
-        if not self.listener_thread:
             if not self.hotkey_combo:
                  print("[Hotkey] Listener not started: Hotkey combo is empty in settings.")
                  return
 
-            print(f"[Hotkey] Starting listener thread for: {self.hotkey_combo}")
+            print(f"[Hotkey] Starting new listener thread for: {self.hotkey_combo}")
             try:
                 self.listener_thread = HotkeyListener(self.hotkey_combo, self.hotkey_signal_emitter)
-                self.listener_thread.start()
-                print("[Hotkey] Listener thread started.")
-            except ValueError as ve: # Catch specific hotkey parsing errors
+                self.listener_thread.start() # Thread starts with action enabled by default
+                print("[Hotkey] New listener thread started.")
+            except ValueError as ve:
                 QMessageBox.critical(self, "Hotkey Error", f"Invalid hotkey format: '{self.hotkey_combo}'\n{ve}\n\nPlease change it in Settings.");
                 self.listener_thread = None; print(f"[Hotkey] Listener start failed (ValueError): {ve}")
-            except Exception as e: # Catch other errors (permissions etc)
+            except Exception as e:
                 info_text = "\nCheck hotkey format & ensure no other app uses it.";
                 if any(s in str(e).lower() for s in ["permission", "administrator", "root", "access denied", "sudo"]):
                      info_text += "\nThis often requires administrator/root privileges."
                 QMessageBox.critical(self, "Hotkey Error", f"Failed to start listener for '{self.hotkey_combo}':\n{e}{info_text}");
                 self.listener_thread = None; print(f"[Hotkey] Listener start failed (Exception): {e}")
+        
         self.update_status_bar()
 
 
-    def stop_hotkey_listener(self, intentional=True):
-        """Stops the hotkey listener thread."""
-        if intentional:
-             self.is_listener_intentionally_stopped = True
-             print("[Hotkey] Listener stop requested intentionally.")
-
-        listener_was_running = self.listener_thread and self.listener_thread.is_alive()
-        if listener_was_running:
-            print(f"[Hotkey] Stopping listener thread ({self.hotkey_combo})...")
-            try:
-                self.listener_thread.stop(); # Calls stop() method in HotkeyListener class
-                self.listener_thread.join(timeout=0.5); # Wait briefly for thread to exit
-                if self.listener_thread.is_alive():
-                     print("[Hotkey] Warning: Listener thread did not exit cleanly after stop request.")
-                else: print("[Hotkey] Listener thread stopped.")
-            except Exception as e: print(f"[Hotkey] Error stopping listener thread: {e}")
-            finally: self.listener_thread = None # Clear reference regardless
-        elif self.listener_thread: # Thread object exists but not alive
-             self.listener_thread = None # Clear reference
-
+    def disable_hotkey_action_temporarily(self):
+        """Disables the hotkey listener's action without stopping the thread or removing the OS hook."""
+        if self.listener_thread and self.listener_thread.is_alive():
+            print(f"[Hotkey] Disabling action for listener thread ({self.hotkey_combo})...")
+            self.listener_thread.disable_action()
+        else:
+            print(f"[Hotkey] No active listener thread to disable action for.")
         self.update_status_bar()
 
 
@@ -3226,8 +3336,9 @@ class MainWindow(QMainWindow):
                 event.ignore() # Prevent actual closing
             else:
                 print("[Close Event] No tray icon, quitting application.")
-                event.accept() # Allow closing -> triggers quit_application via aboutToQuit signal
-                self.quit_application()
+            # event.accept() # Allow closing -> triggers quit_application via aboutToQuit signal
+            self.quit_application() # Directly call quit
+            event.accept()
 
 
     def quit_application(self):
@@ -3244,7 +3355,14 @@ class MainWindow(QMainWindow):
 
         print("Proceeding with application quit.")
         self.save_auto_send_status()
-        self.stop_hotkey_listener(intentional=True)
+        
+        # Fully stop the hotkey listener thread
+        if self.listener_thread and self.listener_thread.is_alive():
+            print("[Quit] Stopping hotkey listener thread...")
+            self.listener_thread.stop()
+            self.listener_thread.join(timeout=0.5)
+        self.listener_thread = None
+
         self.stop_file_watcher()
         if self.active_notification_dialog:
             try: print("Closing notification dialog on quit..."); self.active_notification_dialog.reject()

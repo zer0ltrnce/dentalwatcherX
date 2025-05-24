@@ -75,6 +75,8 @@ SETTINGS_DUPLICATE_CHECK_ACTION = "duplicate_check_action" # For manual actions
 DEFAULT_DUPLICATE_CHECK_ACTION = "ask" # 'ask', 'overwrite', 'skip'
 SETTINGS_AUTO_DUPLICATE_ACTION = "auto_duplicate_action" # For auto-send/triggered updates
 DEFAULT_AUTO_DUPLICATE_ACTION = "manual" # 'skip', 'overwrite', 'manual' (use manual setting)
+SETTINGS_NETWORK_SCAN_DEPTH = "network_scan_depth"
+DEFAULT_NETWORK_SCAN_DEPTH = 0 # 0 for unlimited, effectively relying on os.walk default.
 
 APP_VERSION = "3.17.0+"
 AUTO_SEND_STATUS_FILE = "autosend_status.json"
@@ -85,6 +87,20 @@ VIEWER_MODEL_COLOR = (0.85, 0.85, 0.9)
 VIEWER_AXES_ENABLED = True
 
 # some helper functions
+
+def is_network_path(path_str: str) -> bool:
+    """
+    Basic check for network paths. Primarily for UNC paths on Windows.
+    For other OSes, this is less reliable and the depth limit is applied if set.
+    """
+    if not path_str:
+        return False
+    # Windows UNC paths
+    if os.name == 'nt' and path_str.startswith('\\\\'):
+        return True
+    # Add other checks if necessary, e.g., for specific mount points on POSIX
+    # For now, keep it simple as the depth limit is the main control.
+    return False
 
 def shorten_path(p, length=2):
     if not p or p == "Not set" or os.sep not in p: return p
@@ -198,75 +214,104 @@ def parse_dental_project(filepath):
 
 
 # directory scanner function
-def scan_directory(watch_folder, target_folder=None):
+def scan_directory(watch_folder, target_folder=None, network_scan_depth=DEFAULT_NETWORK_SCAN_DEPTH):
     """
     Scans the watch_folder (or a specific target_folder within it)
     for projects modified today OR (if target_folder is specified) projects
     containing files modified today. Uses updated file classification for CAM/Print relevance.
     Handles multiple *cad.stl files.
+    Applies network_scan_depth if scanning the whole watch_folder and depth > 0.
     """
-    scan_root = target_folder if (target_folder and os.path.isdir(target_folder)) else watch_folder
+    scan_root_is_watch_folder = not target_folder # True if we are scanning the main watch_folder
+    scan_root = watch_folder if scan_root_is_watch_folder else target_folder
+
     if not scan_root or not os.path.isdir(scan_root):
-        print(f"Scan error: root path invalid {scan_root}")
+        print(f"Scan error: root path invalid '{scan_root}'")
         return []
 
     today_date = datetime.date.today()
     found_projects = []
-    processed_folders = set()
+    processed_folders = set() # Used to avoid re-processing if symlinks or weird structures exist
 
-    if target_folder:
+    # Determine the initial list of directories to scan
+    if not scan_root_is_watch_folder: # Scanning a specific target_folder (e.g., from watcher trigger)
         try:
             items_list = os.listdir(scan_root)
-            root_dirs = [(scan_root, [d for d in items_list if os.path.isdir(os.path.join(scan_root, d))],
-                                     [f for f in items_list if os.path.isfile(os.path.join(scan_root, f))])]
+            # Structure for os.walk: (root, dirnames, filenames)
+            root_dirs_iter = [(scan_root, [d for d in items_list if os.path.isdir(os.path.join(scan_root, d))],
+                                         [f for f in items_list if os.path.isfile(os.path.join(scan_root, f))])]
         except FileNotFoundError:
             print(f"Scan warning: Target folder not found during scan: {scan_root}")
             return []
         except Exception as e:
             print(f"Scan error: Error listing target folder {scan_root}: {e}")
             return []
-    else:
-        root_dirs = os.walk(watch_folder, topdown=True)
+    else: # Full scan of watch_folder
+        # os.walk is a generator, which is good.
+        # We need to normalize watch_folder path for correct depth calculation.
+        normalized_watch_folder = os.path.normpath(watch_folder)
+        root_dirs_iter = os.walk(normalized_watch_folder, topdown=True)
 
 
-    for current_root, dirs, files in root_dirs:
-        is_likely_archive_path = False
-        if not target_folder:
-            basename = os.path.basename(current_root)
-            parent_dir = os.path.dirname(current_root)
+    for current_root, dirs, files in root_dirs_iter:
+        current_folder_norm = os.path.normpath(current_root)
+
+        if scan_root_is_watch_folder: # Apply depth limiting and archive skipping only for full watch_folder scans
+            # Depth calculation
+            # Ensure current_root starts with normalized_watch_folder for correct relative path
+            if current_folder_norm.startswith(normalized_watch_folder):
+                relative_path = current_folder_norm[len(normalized_watch_folder):].lstrip(os.sep)
+                depth = relative_path.count(os.sep) if relative_path else 0
+            else: # Should not happen if os.walk is used correctly with watch_folder
+                depth = 0 
+
+            if network_scan_depth > 0 and depth >= network_scan_depth:
+                print(f"[Scan Depth] Reached depth limit ({network_scan_depth}) at '{current_folder_norm}'. Pruning dirs: {dirs}")
+                dirs[:] = [] # Don't go deeper
+
+            # Archive path skipping logic (remains unchanged)
+            is_likely_archive_path = False
+            basename = os.path.basename(current_folder_norm)
+            parent_dir = os.path.dirname(current_folder_norm)
             parent_basename = os.path.basename(parent_dir)
             grandparent_dir = os.path.dirname(parent_dir)
             grandparent_basename = os.path.basename(grandparent_dir)
 
-            if basename.isdigit() and len(basename) == 2:
-                if parent_basename.isdigit() and len(parent_basename) == 2:
-                    if grandparent_basename.isdigit() and len(grandparent_basename) == 4:
+            if basename.isdigit() and len(basename) == 2: # DD
+                if parent_basename.isdigit() and len(parent_basename) == 2: # MM
+                    if grandparent_basename.isdigit() and len(grandparent_basename) == 4: # YYYY
                         is_likely_archive_path = True
-            elif parent_basename.isdigit() and len(parent_basename) == 4:
-                 if basename.isdigit() and len(basename) == 2:
-                    is_likely_archive_path = True
+            elif parent_basename.isdigit() and len(parent_basename) == 4: # YYYY
+                 if basename.isdigit() and len(basename) == 2: # MM (less common structure, but possible)
+                    # This could be YYYY/MM, check if dirs contains DD
+                    # For simplicity, we'll stick to YYYY/MM/DD as the primary archive marker
+                    pass
+
 
             if is_likely_archive_path:
-                dirs[:] = []
-                continue
+                print(f"[Scan Depth] Skipping likely archive path: {current_folder_norm}")
+                dirs[:] = [] # Prune archive subfolders
+                continue # Don't process files in this folder either, go to next item from os.walk
 
-            current_folder_norm = os.path.normpath(current_root)
-            if current_folder_norm in processed_folders:
+            if current_folder_norm in processed_folders: # Avoid reprocessing (e.g. symlink loops)
+                print(f"[Scan Depth] Already processed, skipping: {current_folder_norm}")
+                dirs[:] = [] # Don't descend again
                 continue
+            processed_folders.add(current_folder_norm)
 
         folder_modified_today = False
         latest_mtime_today = 0.0
         relevant_files_in_folder = []
 
         for filename in files:
-            filepath = os.path.join(current_root, filename)
+            filepath = os.path.join(current_folder_norm, filename) # Use normalized current_folder_norm
             try:
                 filename_lower = filename.lower()
                 ext_lower = os.path.splitext(filename_lower)[1]
                 if ext_lower not in [".dentalproject", ".constructioninfo", ".stl"]:
                     continue
 
-                if not os.path.isfile(filepath): continue
+                if not os.path.isfile(filepath): continue # Should not happen with os.walk files list
 
                 mtime_ts = os.path.getmtime(filepath)
                 base_name_lower = os.path.splitext(filename_lower)[0]
@@ -282,7 +327,7 @@ def scan_directory(watch_folder, target_folder=None):
                 if is_stl:
                     if filename_lower.endswith("cad.stl"):
                         is_cad_stl = True
-                    elif "model" in base_name_lower:
+                    elif "model" in base_name_lower: # Covers *model*.stl, *models*.stl etc.
                         is_model_stl = True
                     else:
                         is_other_stl = True
@@ -293,98 +338,87 @@ def scan_directory(watch_folder, target_folder=None):
                     latest_mtime_today = max(latest_mtime_today, mtime_ts)
 
                 file_info = {
-                    'path': filepath,
-                    'name': filename,
-                    'base': os.path.splitext(filename)[0],
-                    'is_project': is_project,
-                    'is_info': is_info,
-                    'is_stl': is_stl,
-                    'is_cad_stl': is_cad_stl,
-                    'is_model_stl': is_model_stl,
-                    'is_other_stl': is_other_stl,
+                    'path': filepath, 'name': filename, 'base': os.path.splitext(filename)[0],
+                    'is_project': is_project, 'is_info': is_info, 'is_stl': is_stl,
+                    'is_cad_stl': is_cad_stl, 'is_model_stl': is_model_stl, 'is_other_stl': is_other_stl,
                     'mtime': mtime_ts
                 }
                 relevant_files_in_folder.append(file_info)
-
-            except FileNotFoundError:
+            except FileNotFoundError: # File might disappear during scan
                 continue
-            except Exception as e:
+            except Exception as e_file: # Catch other errors reading file properties
+                print(f"Error processing file '{filepath}': {e_file}")
                 continue
 
-        if folder_modified_today or target_folder:
-            if not target_folder:
-                processed_folders.add(os.path.normpath(current_root))
-
-            project_files = sorted([f for f in relevant_files_in_folder if f['is_project']], key=lambda x: x['mtime'],
-                                   reverse=True)
-            if not project_files:
-                if not target_folder:
-                    continue
-                else:
-                    project_base_name = os.path.basename(current_root)
+        # After processing all files in current_root, decide if this folder is a project
+        # A folder is considered a project if it contains files modified today,
+        # OR if we are scanning a specific target_folder (triggered by watcher).
+        if folder_modified_today or not scan_root_is_watch_folder:
+            project_files = sorted([f for f in relevant_files_in_folder if f['is_project']], key=lambda x: x['mtime'], reverse=True)
+            
+            if not project_files: # No .dentalProject file
+                if not scan_root_is_watch_folder: # If it's a specific target_folder scan (watcher)
+                    project_base_name = os.path.basename(current_folder_norm)
                     project_path = None
                     parsed_data = {"patient": project_base_name, "practice": "N/A", "work_type": "N/A", "teeth": "?", "filename": "N/A", "case_id": ""}
-            else:
-                project_file_info = project_files[0]
+                else: # Full scan and no .dentalProject file, skip this folder
+                    continue 
+            else: # Has .dentalProject file(s)
+                project_file_info = project_files[0] # Use the most recent one
                 project_path = project_file_info['path']
                 project_base_name = project_file_info['base']
                 parsed_data = parse_dental_project(project_path)
-                if not parsed_data:
+                if not parsed_data: # Parsing failed
                     parsed_data = {
-                        "patient": project_base_name,
-                        "practice": "N/A",
-                        "work_type": "Parse Error",
-                        "teeth": "?",
-                        "filename": project_file_info['name'],
-                        "case_id": ""
+                        "patient": project_base_name, "practice": "N/A",
+                        "work_type": "Parse Error", "teeth": "?",
+                        "filename": project_file_info['name'], "case_id": ""
                     }
 
+            # Gather associated files based on project_base_name or any relevant files if base_name is generic
             info_file = next((f for f in relevant_files_in_folder if f['is_info'] and f['base'] == project_base_name), None)
-            if not info_file: info_file = next((f for f in relevant_files_in_folder if f['is_info']), None)
+            if not info_file: info_file = next((f for f in relevant_files_in_folder if f['is_info']), None) # Fallback: any info file
             info_path = info_file['path'] if info_file else None
 
             cad_stl_files = [f for f in relevant_files_in_folder if f['is_cad_stl']]
-            cad_stl_paths = [f['path'] for f in cad_stl_files]
+            cad_stl_paths = [f['path'] for f in cad_stl_files] # Collect all CAD STLs
 
             model_stl_paths = [f['path'] for f in relevant_files_in_folder if f['is_model_stl']]
             other_stl_paths = [f['path'] for f in relevant_files_in_folder if f['is_other_stl']]
-
+            
             has_cad = bool(cad_stl_paths)
             has_info = bool(info_path)
             has_models = bool(model_stl_paths)
 
-            cam_icon = "✓" if has_cad else "✗"
-            info_icon = "✓" if has_info else "✗"
-            print_icon = "✓" if has_models else "✗"
+            cam_icon = "✓" if has_cad else "✗"; info_icon = "✓" if has_info else "✗"; print_icon = "✓" if has_models else "✗"
             file_status_display = f"{cam_icon}C {info_icon}I {print_icon}P"
 
-            timestamp_to_use = latest_mtime_today if not target_folder else (os.path.getmtime(target_folder) if os.path.exists(target_folder) else time.time())
-            if target_folder and relevant_files_in_folder:
-                 timestamp_to_use = max(f['mtime'] for f in relevant_files_in_folder)
-
+            # Determine the timestamp for sorting:
+            # If scanning a specific target folder, use its mtime or latest file mtime.
+            # If full scan, use the latest file mtime from today.
+            timestamp_to_use = latest_mtime_today
+            if not scan_root_is_watch_folder: # target_folder scan
+                 timestamp_to_use = os.path.getmtime(current_folder_norm) if os.path.exists(current_folder_norm) else time.time()
+                 if relevant_files_in_folder: # If files were found, use the newest one
+                     timestamp_to_use = max(f['mtime'] for f in relevant_files_in_folder)
+            
             project_entry = {
                 "last_modified_timestamp": timestamp_to_use,
                 "patient": parsed_data.get('patient', project_base_name),
                 "work_type": parsed_data.get('work_type', 'N/A'),
                 "teeth": parsed_data.get('teeth', '?'),
-                "file_status": file_status_display,
-                "base_name": project_base_name,
-                "project_path": project_path,
-                "info_path": info_path,
-                "cad_stl_paths": cad_stl_paths,
-                "other_stl_paths": other_stl_paths,
-                "model_stl_paths": model_stl_paths,
-                "parsed_data": parsed_data,
-                "folder_path": current_root,
-                "has_cad": has_cad,
-                "has_info": has_info,
-                "has_models": has_models,
+                "file_status": file_status_display, "base_name": project_base_name,
+                "project_path": project_path, "info_path": info_path,
+                "cad_stl_paths": cad_stl_paths, "other_stl_paths": other_stl_paths,
+                "model_stl_paths": model_stl_paths, "parsed_data": parsed_data,
+                "folder_path": current_folder_norm,
+                "has_cad": has_cad, "has_info": has_info, "has_models": has_models,
                 "status_icons": (cam_icon, info_icon, print_icon)
             }
             found_projects.append(project_entry)
 
-            if target_folder:
-                 break
+            if not scan_root_is_watch_folder: # If scanning a specific target_folder, we are done with this single iteration.
+                 break 
 
     found_projects.sort(key=lambda x: x['last_modified_timestamp'], reverse=True)
     return found_projects
@@ -474,6 +508,7 @@ class HotkeyListener(threading.Thread):
         self.hotkey_combo = hotkey_combo
         self.signal_emitter = signal_emitter
         self._running = True
+        self.enabled = True  # New instance variable
         self._hooked_key_ref = None
         self._last_emit_time = 0
         self._debounce_interval = 0.3
@@ -484,7 +519,7 @@ class HotkeyListener(threading.Thread):
         try:
             def _callback_wrapper():
                 current_time = time.time()
-                if self._running and (current_time - self._last_emit_time > self._debounce_interval):
+                if self._running and self.enabled and (current_time - self._last_emit_time > self._debounce_interval):
                     self._last_emit_time = current_time
                     try:
                         self.signal_emitter.hotkey_pressed.emit()
@@ -500,7 +535,15 @@ class HotkeyListener(threading.Thread):
         except Exception as e: self._running = False; print(f"[Hotkey Listener ERROR] Listener exception: {e}")
         finally:
             print(f"[Hotkey Listener] Listener ({self.hotkey_combo}) thread exiting run loop.");
-            self.remove_hook()
+            self.remove_hook() # Ensure hook is removed on exit
+
+    def enable_action(self):
+        self.enabled = True
+        print(f"[Hotkey Listener] Action for '{self.hotkey_combo}' ENABLED.")
+
+    def disable_action(self):
+        self.enabled = False
+        print(f"[Hotkey Listener] Action for '{self.hotkey_combo}' DISABLED.")
 
     def remove_hook(self):
         """Removes the registered hotkey hook."""
@@ -515,11 +558,17 @@ class HotkeyListener(threading.Thread):
     def stop(self):
         """Sets the running flag to False to stop the thread loop and removes the hook."""
         print(f"[Hotkey Listener] Listener ({self.hotkey_combo}) stop() called.")
-        self._running = False;
-        self.remove_hook()
+        self._running = False # Signal thread to stop
+        self.remove_hook() # Remove the OS-level hook
         if KEYBOARD_AVAILABLE and self.hotkey_combo:
-            try: parts = self.hotkey_combo.split('+'); key = parts[-1].strip(); keyboard.release(key)
-            except Exception: pass
+            try:
+                # Attempt to release the last key in the combo to break the listener wait
+                parts = self.hotkey_combo.split('+')
+                key_to_release = parts[-1].strip()
+                if key_to_release:
+                    keyboard.release(key_to_release)
+            except Exception as e:
+                print(f"[Hotkey Listener] Minor issue trying to release key during stop: {e}")
 
 
 # function for dummy icon generation (used in main.py)
